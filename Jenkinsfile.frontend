@@ -1,0 +1,265 @@
+pipeline {
+    agent any
+
+    environment {
+        PROJECT_NAME = "job-portal-backend"
+        PORT         = "4000"
+        IMAGE_TAG    = "${env.BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Clone Repository') {
+            steps {
+                echo "Cloning React Job Portal repository..."
+                git branch: 'main',
+                    credentialsId: 'github-pat',
+                    url: 'https://github.com/tasbirul/react-job-portal.git'
+            }
+        }
+
+        stage('Prepare Configuration File') {
+            steps {
+                dir('backend') {
+                    writeFile file: 'Dockerfile', text: """
+FROM node:22-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:22-slim AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+COPY --chown=node:node . .
+USER node
+EXPOSE ${env.PORT}
+CMD ["node", "server.js"]
+"""
+                }
+            }
+        }
+
+        stage('Pre-Build Security Scans') {
+            parallel {
+                stage('Secrets Detection') {
+                    steps {
+                        dir('backend') {
+                            script {
+                                def rc = sh(
+                                    script: 'betterleaks dir . --report-path betterleaks.json --report-format json',
+                                    returnStatus: true
+                                )
+                                if (rc != 0) {
+                                    unstable("betterleaks detected potential leaked credentials (exit ${rc})")
+                                }
+                                archiveArtifacts artifacts: 'betterleaks.*', allowEmptyArchive: true, fingerprint: true
+                            }
+                        }
+                    }
+                }
+
+                stage('SAST Scanning') {
+                    steps {
+                        dir('backend') {
+                            sh 'semgrep scan --config auto --json --output=semgrep.json'
+                            archiveArtifacts artifacts: 'semgrep.*', allowEmptyArchive: true, fingerprint: true
+                        }
+                    }
+                }
+
+                stage('Dependency & FS Scan') {
+                    steps {
+                        dir('backend') {
+                            sh '''
+                                trivy fs . \\
+                                    --scanners vuln,misconfig,secret \\
+                                    --skip-files 'betterleaks.json,semgrep.json,.pkgjson.md5' \\
+                                    --format json -o trivy-fs-report.json
+
+                                if [ -f "/vagrant/html.tpl" ]; then
+                                    trivy convert --format template --template "@/vagrant/html.tpl" -o trivy-fs-report.html trivy-fs-report.json
+                                fi
+                            '''
+                            archiveArtifacts artifacts: 'trivy-fs-report.*', allowEmptyArchive: true, fingerprint: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('backend') {
+                    echo "🔨 Building Docker image: ${env.PROJECT_NAME}:v${env.IMAGE_TAG}"
+                    sh "docker build -t ${env.PROJECT_NAME}:v${env.IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                dir('backend') {
+                    sh """
+                        trivy image \\
+                            --scanners vuln,misconfig,secret \\
+                            --severity HIGH,CRITICAL \\
+                            --format json -o trivy-image-report.json "${env.PROJECT_NAME}:v${env.IMAGE_TAG}"
+
+                        if [ -f "/vagrant/html.tpl" ]; then
+                            trivy convert --format template --template "@/vagrant/html.tpl" -o trivy-image-report.html trivy-image-report.json
+                        fi
+                    """
+                    archiveArtifacts artifacts: 'trivy-image-report.*', allowEmptyArchive: true, fingerprint: true
+                }
+            }
+        }
+
+        stage('Run Backend Container') {
+            steps {
+                script {
+                    echo "Deploying container for build #${env.IMAGE_TAG}..."
+                    sh """
+                        docker ps -q --filter "name=^${env.PROJECT_NAME}" | xargs -r docker rm -f || true
+                        docker run -d \\
+                            -p ${env.PORT}:${env.PORT} \\
+                            --name ${env.PROJECT_NAME}-v${env.IMAGE_TAG} \\
+                            --restart unless-stopped \\
+                            ${env.PROJECT_NAME}:v${env.IMAGE_TAG}
+                    """
+                    sleep(3)
+                }
+            }
+        }
+
+        stage('Verify Backend Health') {
+            steps {
+                sh "docker logs --tail 30 ${env.PROJECT_NAME}-v${env.IMAGE_TAG}"
+                sh """
+                    for i in \$(seq 1 5); do
+                        STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${env.PORT}/ || true)
+                        echo "Attempt \$i: HTTP Status \$STATUS"
+                        if [ "\$STATUS" -eq 200 ] || [ "\$STATUS" -eq 404 ]; then
+                            echo "Backend is reachable and responding with status \$STATUS"
+                            exit 0
+                        fi
+                        sleep 2
+                    done
+                    echo "Backend did not respond in time"
+                    exit 1
+                """
+            }
+        }
+    } // Closes stages
+
+    post {
+        failure {
+            echo "FAILED -- Pipeline failed for ${env.PROJECT_NAME}:v${env.IMAGE_TAG}."
+            echo "Check the stage logs above."
+            echo "Sending failure notification..."
+
+            emailext(
+                to: 'test@example.com',
+                subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+Hello,
+
+The Jenkins pipeline has FAILED.
+
+Project:
+${env.PROJECT_NAME}
+
+Build:
+#${env.BUILD_NUMBER}
+
+Status:
+FAILED
+
+Docker Image:
+${env.PROJECT_NAME}:v${env.IMAGE_TAG}
+
+Failed Build URL:
+${env.BUILD_URL}
+
+Mailpit:
+http://localhost:8085
+
+Please check the attached Jenkins console log for details.
+
+Regards,
+Jenkins
+""",
+                attachLog: true,
+                compressLog: false
+            )
+        }
+
+        unstable {
+            echo "Security issues detected. Sending security scan reports..."
+
+            emailext(
+                to: 'test@example.com',
+                subject: "SECURITY FINDINGS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+Hello,
+
+The Jenkins security scanning pipeline has completed.
+
+Security issues were detected during the scanning process.
+
+Project:
+${env.PROJECT_NAME}
+
+Build:
+#${env.BUILD_NUMBER}
+
+Status:
+${currentBuild.currentResult}
+
+Docker Image:
+${env.PROJECT_NAME}:v${env.IMAGE_TAG}
+
+Security scans performed:
+
+1. Betterleaks
+2. Semgrep
+3. Trivy Filesystem
+4. Trivy Docker Image
+
+The security scan reports are attached to this email.
+
+Reports:
+
+- betterleaks.json
+- semgrep.json
+- trivy-fs-report.json
+- trivy-fs-report.html
+- trivy-image-report.json
+- trivy-image-report.html
+
+Build URL:
+${env.BUILD_URL}
+
+Mailpit:
+http://localhost:8085
+
+Please review the attached reports for the detected security findings.
+
+Regards,
+Jenkins
+""",
+                attachmentsPattern: 'backend/betterleaks.json,backend/semgrep.json,backend/trivy-fs-report.*,backend/trivy-image-report.*',
+                attachLog: false
+            )
+        }
+
+        success {
+            echo "Pipeline completed successfully with no security findings."
+        }
+
+        always {
+            echo "Pipeline finished with status: ${currentBuild.currentResult}"
+            cleanWs()
+            sh "docker image prune -f || true"
+        }
+    }
+}
