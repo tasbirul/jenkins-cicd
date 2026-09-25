@@ -2,8 +2,10 @@ pipeline {
     agent any
 
     environment {
-        PROJECT_NAME = "job-portal-backend"
-        PORT         = "4000"
+        PROJECT_NAME = "react-job-portal-fe"
+        PORT         = "80"
+        HOST_PORT    = "5173"
+        BACKEND_URL  = "http://localhost:4000"
         IMAGE_TAG    = "${env.BUILD_NUMBER}"
     }
 
@@ -19,21 +21,32 @@ pipeline {
 
         stage('Prepare Configuration File') {
             steps {
-                dir('backend') {
+                dir('frontend') {
+                    writeFile file: '.env', text: """
+VITE_API_URL=${env.BACKEND_URL}
+VITE_BACKEND_URL=${env.BACKEND_URL}
+REACT_APP_API_URL=${env.BACKEND_URL}
+"""
+                    writeFile file: '.env.production', text: """
+VITE_API_URL=${env.BACKEND_URL}
+VITE_BACKEND_URL=${env.BACKEND_URL}
+REACT_APP_API_URL=${env.BACKEND_URL}
+"""
+
                     writeFile file: 'Dockerfile', text: """
-FROM node:22-slim AS builder
+FROM node:22-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci
+COPY . .
+RUN npm run build
 
-FROM node:22-slim AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --chown=node:node --from=builder /app/node_modules ./node_modules
-COPY --chown=node:node . .
-USER node
-EXPOSE ${env.PORT}
-CMD ["node", "server.js"]
+FROM nginxinc/nginx-unprivileged:alpine AS production
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \\
+  CMD wget --spider -q http://localhost:8080/ || exit 1
+CMD ["nginx", "-g", "daemon off;"]
 """
                 }
             }
@@ -43,7 +56,7 @@ CMD ["node", "server.js"]
             parallel {
                 stage('Secrets Detection') {
                     steps {
-                        dir('backend') {
+                        dir('frontend') {
                             script {
                                 def rc = sh(
                                     script: 'betterleaks dir . --report-path betterleaks.json --report-format json',
@@ -60,7 +73,7 @@ CMD ["node", "server.js"]
 
                 stage('SAST Scanning') {
                     steps {
-                        dir('backend') {
+                        dir('frontend') {
                             sh 'semgrep scan --config auto --json --output=semgrep.json'
                             archiveArtifacts artifacts: 'semgrep.*', allowEmptyArchive: true, fingerprint: true
                         }
@@ -69,11 +82,11 @@ CMD ["node", "server.js"]
 
                 stage('Dependency & FS Scan') {
                     steps {
-                        dir('backend') {
+                        dir('frontend') {
                             sh '''
                                 trivy fs . \\
                                     --scanners vuln,misconfig,secret \\
-                                    --skip-files 'betterleaks.json,semgrep.json,.pkgjson.md5' \\
+                                    --skip-files 'betterleaks.json,semgrep.json,.env*' \\
                                     --format json -o trivy-fs-report.json
 
                                 if [ -f "/vagrant/html.tpl" ]; then
@@ -89,7 +102,7 @@ CMD ["node", "server.js"]
 
         stage('Build Docker Image') {
             steps {
-                dir('backend') {
+                dir('frontend') {
                     echo "🔨 Building Docker image: ${env.PROJECT_NAME}:v${env.IMAGE_TAG}"
                     sh "docker build -t ${env.PROJECT_NAME}:v${env.IMAGE_TAG} ."
                 }
@@ -98,7 +111,7 @@ CMD ["node", "server.js"]
 
         stage('Trivy Image Scan') {
             steps {
-                dir('backend') {
+                dir('frontend') {
                     sh """
                         trivy image \\
                             --scanners vuln,misconfig,secret \\
@@ -114,14 +127,14 @@ CMD ["node", "server.js"]
             }
         }
 
-        stage('Run Backend Container') {
+        stage('Run Frontend Container') {
             steps {
                 script {
                     echo "Deploying container for build #${env.IMAGE_TAG}..."
                     sh """
                         docker ps -q --filter "name=^${env.PROJECT_NAME}" | xargs -r docker rm -f || true
                         docker run -d \\
-                            -p ${env.PORT}:${env.PORT} \\
+                            -p ${env.HOST_PORT}:8080 \\
                             --name ${env.PROJECT_NAME}-v${env.IMAGE_TAG} \\
                             --restart unless-stopped \\
                             ${env.PROJECT_NAME}:v${env.IMAGE_TAG}
@@ -131,25 +144,13 @@ CMD ["node", "server.js"]
             }
         }
 
-        stage('Verify Backend Health') {
+        stage('Verify Frontend Health') {
             steps {
                 sh "docker logs --tail 30 ${env.PROJECT_NAME}-v${env.IMAGE_TAG}"
-                sh """
-                    for i in \$(seq 1 5); do
-                        STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${env.PORT}/ || true)
-                        echo "Attempt \$i: HTTP Status \$STATUS"
-                        if [ "\$STATUS" -eq 200 ] || [ "\$STATUS" -eq 404 ]; then
-                            echo "Backend is reachable and responding with status \$STATUS"
-                            exit 0
-                        fi
-                        sleep 2
-                    done
-                    echo "Backend did not respond in time"
-                    exit 1
-                """
+                sh "curl --fail --retry 5 --retry-delay 2 --retry-connrefused -fsSI http://localhost:${env.HOST_PORT}/"
             }
         }
-    } // Closes stages
+    }
 
     post {
         failure {
@@ -247,7 +248,7 @@ Please review the attached reports for the detected security findings.
 Regards,
 Jenkins
 """,
-                attachmentsPattern: 'backend/betterleaks.json,backend/semgrep.json,backend/trivy-fs-report.*,backend/trivy-image-report.*',
+                attachmentsPattern: 'frontend/betterleaks.json,frontend/semgrep.json,frontend/trivy-fs-report.*,frontend/trivy-image-report.*',
                 attachLog: false
             )
         }
